@@ -144,6 +144,7 @@ pub fn build_trace_with_max_len(
         core_trace_contexts,
         program_info.kernel().clone(),
         fragment_size,
+        max_trace_len,
     )?;
 
     // Calculate trace length
@@ -156,11 +157,15 @@ pub fn build_trace_with_max_len(
         TraceLenSummary::new(core_trace_len, range_table_len, ChipletsLengths::new(&chiplets));
 
     // Compute the final main trace length
-    let main_trace_len =
-        compute_main_trace_length(core_trace_len, range_table_len, chiplets.trace_len());
+    let main_trace_len = compute_main_trace_length(
+        core_trace_len,
+        range_table_len,
+        chiplets.trace_len(),
+        max_trace_len,
+    )?;
 
-    let ((), (range_checker_trace, chiplets_trace)) = rayon::join(
-        || pad_trace_columns(&mut core_trace_columns, main_trace_len),
+    let (pad_result, (range_checker_trace, chiplets_trace)) = rayon::join(
+        || pad_trace_columns(&mut core_trace_columns, main_trace_len, max_trace_len),
         || {
             rayon::join(
                 || range_checker.into_trace_with_table(range_table_len, main_trace_len),
@@ -168,6 +173,7 @@ pub fn build_trace_with_max_len(
             )
         },
     );
+    pad_result?;
 
     // Padding to make the number of columns a multiple of 8 i.e., the Poseidon2 permutation rate
     let padding_columns = vec![vec![ZERO; main_trace_len]; PADDED_TRACE_WIDTH - TRACE_WIDTH];
@@ -182,7 +188,11 @@ pub fn build_trace_with_max_len(
 
     // Create the MainTrace
     let main_trace = {
-        let last_program_row = RowIndex::from((core_trace_len as u32).saturating_sub(1));
+        let last_program_row = core_trace_len
+            .checked_sub(1)
+            .and_then(|n| u32::try_from(n).ok())
+            .map(RowIndex::from)
+            .ok_or(ExecutionError::TraceLenExceeded(max_trace_len))?;
         let col_matrix = ColMatrix::new(trace_columns);
         MainTrace::new(col_matrix, last_program_row)
     };
@@ -211,13 +221,16 @@ fn compute_main_trace_length(
     core_trace_len: usize,
     range_table_len: usize,
     chiplets_trace_len: usize,
-) -> usize {
+    max_trace_len: usize,
+) -> Result<usize, ExecutionError> {
     // Get the trace length required to hold all execution trace steps
     let max_len = range_table_len.max(core_trace_len).max(chiplets_trace_len);
 
     // Pad the trace length to the next power of two
-    let trace_len = max_len.next_power_of_two();
-    core::cmp::max(trace_len, MIN_TRACE_LEN)
+    let trace_len = max_len
+        .checked_next_power_of_two()
+        .ok_or(ExecutionError::TraceLenExceeded(max_trace_len))?;
+    Ok(core::cmp::max(trace_len, MIN_TRACE_LEN))
 }
 
 /// Generates core trace fragments in parallel from the provided trace fragment contexts.
@@ -225,9 +238,15 @@ fn generate_core_trace_columns(
     core_trace_contexts: Vec<CoreTraceFragmentContext>,
     kernel: Kernel,
     fragment_size: usize,
+    max_trace_len: usize,
 ) -> Result<Vec<Vec<Felt>>, ExecutionError> {
+    let total_fragment_capacity = core_trace_contexts
+        .len()
+        .checked_mul(fragment_size)
+        .ok_or(ExecutionError::TraceLenExceeded(max_trace_len))?;
+
     let mut core_trace_columns: Vec<Vec<Felt>> =
-        vec![vec![ZERO; core_trace_contexts.len() * fragment_size]; CORE_TRACE_WIDTH];
+        vec![vec![ZERO; total_fragment_capacity]; CORE_TRACE_WIDTH];
 
     // Save the first stack top for initialization
     let first_stack_top = if let Some(first_context) = core_trace_contexts.first() {
@@ -261,12 +280,14 @@ fn generate_core_trace_columns(
     // Separate fragments, stack_rows, and system_rows
     let mut stack_rows = Vec::new();
     let mut system_rows = Vec::new();
-    let mut total_core_trace_rows = 0;
+    let mut total_core_trace_rows: usize = 0;
 
     for final_state in fragment_results {
         stack_rows.push(final_state.last_stack_cols);
         system_rows.push(final_state.last_system_cols);
-        total_core_trace_rows += final_state.num_rows_written;
+        total_core_trace_rows = total_core_trace_rows
+            .checked_add(final_state.num_rows_written)
+            .ok_or(ExecutionError::TraceLenExceeded(max_trace_len))?;
     }
 
     // Fix up stack and system rows
@@ -658,9 +679,18 @@ fn initialize_chiplets(
     Ok(chiplets)
 }
 
-fn pad_trace_columns(trace_columns: &mut [Vec<Felt>], main_trace_len: usize) {
+fn pad_trace_columns(
+    trace_columns: &mut [Vec<Felt>],
+    main_trace_len: usize,
+    max_trace_len: usize,
+) -> Result<(), ExecutionError> {
     let total_program_rows = trace_columns[0].len();
-    assert!(total_program_rows <= main_trace_len);
+    if total_program_rows > main_trace_len {
+        return Err(ExecutionError::Internal("program rows exceed main trace length"));
+    }
+    if main_trace_len.checked_sub(1).and_then(|n| u32::try_from(n).ok()).is_none() {
+        return Err(ExecutionError::TraceLenExceeded(max_trace_len));
+    }
 
     let num_padding_rows = main_trace_len - total_program_rows;
 
@@ -669,8 +699,11 @@ fn pad_trace_columns(trace_columns: &mut [Vec<Felt>], main_trace_len: usize) {
 
     // Pad CLK trace - fill with index values
     for padding_row_idx in 0..num_padding_rows {
-        trace_columns[CLK_COL_IDX]
-            .push(Felt::from_u32((total_program_rows + padding_row_idx) as u32));
+        let clk = total_program_rows
+            .checked_add(padding_row_idx)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or(ExecutionError::TraceLenExceeded(max_trace_len))?;
+        trace_columns[CLK_COL_IDX].push(Felt::from_u32(clk));
     }
 
     // Pad CTX trace - fill with ZEROs (root context)
@@ -744,6 +777,8 @@ fn pad_trace_columns(trace_columns: &mut [Vec<Felt>], main_trace_len: usize) {
         let last_stack_value = trace_columns[col_idx][total_program_rows - 1];
         trace_columns[col_idx].resize(main_trace_len, last_stack_value);
     }
+
+    Ok(())
 }
 
 /// Uses the provided `CoreTraceFragmentContext` to build and return a `ReplayProcessor` and
